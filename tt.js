@@ -227,19 +227,19 @@ document.addEventListener("visibilitychange", () => {
         const newMessagesNode = totalMessagesStatNode.querySelector('#otk-stat-new-messages');
         const newRepliesNode = totalMessagesStatNode.querySelector('#otk-stat-new-replies');
 
-        // Extract numbers to ensure consistent formatting
-        const msgMatch = newMessagesNode?.textContent.match(/\d+/);
-        const replyMatch = newRepliesNode?.textContent.match(/\d+/);
-        const msgCount = msgMatch ? parseInt(msgMatch[0], 10) : 0;
-        const replyCount = replyMatch ? parseInt(replyMatch[0], 10) : 0;
+        const msgText = newMessagesNode?.textContent.trim() || '';
+        const replyText = newRepliesNode?.textContent.trim() || '';
 
         let newPrefix = '';
-        if (msgCount > 0 && replyCount > 0) {
-            newPrefix = `(+${msgCount} | +${replyCount}) `;
-        } else if (msgCount > 0) {
-            newPrefix = `(+${msgCount}) `;
-        } else if (replyCount > 0) {
-            newPrefix = `(+${replyCount}) `;
+        if (msgText && replyText) {
+            newPrefix = `${msgText} ${replyText} `;
+        } else if (msgText || replyText) {
+            newPrefix = `${msgText}${replyText} `;
+        }
+
+        // Ensure newPrefix has parens if it doesn't already and isn't empty
+        if (newPrefix && !newPrefix.startsWith('(')) {
+            newPrefix = '(' + newPrefix.trim() + ') ';
         }
 
         // Robust base title sync
