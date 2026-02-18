@@ -87,46 +87,6 @@ function createStatsDisplayElements(statsWrapperParam) {
 }
 
     // --- IIFE Scope Helper for Intersection Observer ---
-    function flashStuff(newMessages, newReplies) {
-    const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-    if (themeSettings.tabTitleStatsAnimation !== 'Flash') {
-        if (titleFlashingInterval) {
-            clearInterval(titleFlashingInterval);
-            titleFlashingInterval = null;
-        }
-        document.title = originalTitle; // Restore original title when animation is disabled
-        return;
-    }
-
-    if (titleFlashingInterval) {
-        clearInterval(titleFlashingInterval);
-    }
-
-    let isOriginalTitle = true;
-    const speed = parseFloat(themeSettings.tabTitleStatsAnimationSpeed) || 1.0;
-    const intervalDuration = 1000 / speed;
-
-    titleFlashingInterval = setInterval(() => {
-        if (tabHidden) { // Only flash when tab is not active
-            if (isOriginalTitle) {
-                let titlePrefix = '';
-                if (newMessages > 0 && newReplies > 0) {
-                    titlePrefix = `(+${newMessages} | +${newReplies}) `;
-                } else if (newMessages > 0) {
-                    titlePrefix = `(+${newMessages}) `;
-                } else if (newReplies > 0) {
-                    titlePrefix = `(0 | +${newReplies}) `;
-                }
-                document.title = titlePrefix + originalTitle;
-            } else {
-                document.title = originalTitle;
-            }
-            isOriginalTitle = !isOriginalTitle;
-        } else {
-            document.title = originalTitle; // Keep original title when tab is active
-        }
-    }, intervalDuration);
-}
     function handleIntersection(entries, observerInstance) {
         entries.forEach(entry => {
             const wrapper = entry.target;
@@ -221,6 +181,7 @@ let statAnimationTimers = [];
 
 document.addEventListener("visibilitychange", () => {
   tabHidden = document.hidden;
+  if (typeof updateTabTitle === 'function') updateTabTitle();
 });
 
     // Constants for storage keys
@@ -243,6 +204,7 @@ document.addEventListener("visibilitychange", () => {
     const TWEET_EMBED_MODE_KEY = 'otkTweetEmbedMode'; // For tweet embed theme
     const TWEET_CACHE_KEY = 'otkTweetCache'; // For caching tweet HTML
     const MAIN_THEME_KEY = 'otkMainTheme';
+    const THEME_SETTINGS_KEY = 'otkThemeSettings';
     const BLURRED_IMAGES_KEY = 'otkBlurredImages';
     const IMAGE_BLUR_AMOUNT_KEY = 'otkImageBlurAmount';
     const BLOCKED_THREADS_KEY = 'otkBlockedThreads';
@@ -255,7 +217,64 @@ document.addEventListener("visibilitychange", () => {
     let titleFlashingInterval = null;
     let threadTitleAnimationIndex = 0;
     let originalTitle = document.title;
+    let currentTitlePrefix = '';
     let otkViewer = null;
+
+    function updateTabTitle() {
+        const totalMessagesStatNode = document.getElementById('otk-total-messages-stat');
+        if (!totalMessagesStatNode) return;
+
+        const newMessagesNode = totalMessagesStatNode.querySelector('#otk-stat-new-messages');
+        const newRepliesNode = totalMessagesStatNode.querySelector('#otk-stat-new-replies');
+
+        // Extract numbers to ensure consistent formatting
+        const msgMatch = newMessagesNode?.textContent.match(/\d+/);
+        const replyMatch = newRepliesNode?.textContent.match(/\d+/);
+        const msgCount = msgMatch ? parseInt(msgMatch[0], 10) : 0;
+        const replyCount = replyMatch ? parseInt(replyMatch[0], 10) : 0;
+
+        let newPrefix = '';
+        if (msgCount > 0 && replyCount > 0) {
+            newPrefix = `(+${msgCount} | +${replyCount}) `;
+        } else if (msgCount > 0) {
+            newPrefix = `(+${msgCount}) `;
+        } else if (replyCount > 0) {
+            newPrefix = `(+${replyCount}) `;
+        }
+
+        // Robust base title sync
+        const currentTitle = document.title;
+        if (currentTitlePrefix && currentTitle.startsWith(currentTitlePrefix)) {
+            const base = currentTitle.substring(currentTitlePrefix.length);
+            if (base && base !== originalTitle) {
+                originalTitle = base;
+            }
+        } else if (currentTitle !== originalTitle && !currentTitle.startsWith('(') && !currentTitle.startsWith('[Suspended]')) {
+             originalTitle = currentTitle;
+        }
+
+        currentTitlePrefix = newPrefix;
+
+        if (titleFlashingInterval) {
+            clearInterval(titleFlashingInterval);
+            titleFlashingInterval = null;
+        }
+
+        const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+        const isFlashEnabled = themeSettings.tabTitleStatsAnimation === 'Flash';
+
+        if (isFlashEnabled && newPrefix && document.hidden) {
+            let showingPrefix = true;
+            document.title = newPrefix + originalTitle;
+            const speed = parseFloat(themeSettings.tabTitleStatsAnimationSpeed) || 1.0;
+            titleFlashingInterval = setInterval(() => {
+                showingPrefix = !showingPrefix;
+                document.title = showingPrefix ? newPrefix + originalTitle : originalTitle;
+            }, 1000 / speed);
+        } else {
+            document.title = newPrefix + originalTitle;
+        }
+    }
     let cityData = [];
     // Debug mode (load from localStorage, default to false)
     let DEBUG_MODE = localStorage.getItem(DEBUG_MODE_KEY) === null ? false : localStorage.getItem(DEBUG_MODE_KEY) === 'true';
@@ -1496,44 +1515,6 @@ function createTweetEmbedElement(tweetId) {
 
 
     // (+n) Stat Update Logic
-function resetPlusN() {
-  const el = document.querySelector('.z-stats .z-new');
-  if (el) {
-    el.textContent = '';
-    el.style.opacity = '0';
-    el.classList.remove('active');
-  }
-  if (statAnimationFrameId) {
-    cancelAnimationFrame(statAnimationFrameId);
-    statAnimationFrameId = null;
-  }
-}
-
-function animateStatIncrease(statEl, plusNEl, from, to) {
-  const duration = 600;
-  const start = performance.now();
-
-  plusNEl.textContent = `+${to - from}`;
-  plusNEl.style.opacity = '1';
-  plusNEl.classList.add('active');
-
-  function animate(time) {
-    const progress = Math.min(1, (time - start) / duration);
-    const currentVal = Math.floor(from + (to - from) * progress);
-    statEl.textContent = currentVal;
-
-    if (progress < 1) {
-      statAnimationFrameId = requestAnimationFrame(animate);
-    } else {
-      statEl.textContent = to;
-      setTimeout(resetPlusN, 1200);
-      statAnimationFrameId = null;
-    }
-  }
-
-  statAnimationFrameId = requestAnimationFrame(animate);
-}
-
 // --- Utility functions ---
     function blobToDataURL(blob) {
         return new Promise((resolve, reject) => {
@@ -5637,63 +5618,6 @@ const scrollButtonContainer = document.getElementById('otk-scroll-button-contain
         updateStatLine(localImagesElem, `- ${padNumber(mainImagesCount, paddingLength)} Image${mainImagesCount === 1 ? '' : 's'}`, 0, 0, 'images');
         updateStatLine(localVideosElem, `- ${padNumber(mainVideosCount, paddingLength)} Video${mainVideosCount === 1 ? '' : 's'}`, 0, 0, 'videos');
 
-        // Title Flashing Logic
-        if (titleFlashingInterval) {
-            clearInterval(titleFlashingInterval);
-            titleFlashingInterval = null;
-        }
-
-        const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-        const newMessagesAnimation = themeSettings.newMessagesStatAnimation !== 'None';
-        const repliesAnimation = themeSettings.repliesStatAnimation !== 'None';
-
-        const shouldFlashNewMessages = newMessages > 0 && newMessagesAnimation;
-        const shouldFlashReplies = newRepliesCount > 0 && repliesAnimation;
-
-        if (shouldFlashNewMessages || shouldFlashReplies) {
-            const newMessagesSpeed = parseFloat(themeSettings.newMessagesStatAnimationSpeed || '1') * 1000;
-            const repliesSpeed = parseFloat(themeSettings.repliesStatAnimationSpeed || '1') * 1000;
-            const flashSpeed = (shouldFlashNewMessages && shouldFlashReplies) ? Math.min(newMessagesSpeed, repliesSpeed) : (shouldFlashNewMessages ? newMessagesSpeed : repliesSpeed);
-
-            titleFlashingInterval = setInterval(() => {
-                let titleText = [];
-                if (shouldFlashNewMessages) titleText.push(`+${newMessages}`);
-                if (shouldFlashReplies) titleText.push(`r+${newRepliesCount}`);
-
-                const prefix = `[${titleText.join(' ')}]`;
-                document.title = document.title.startsWith(prefix) ? originalTitle : `${prefix} ${originalTitle}`;
-            }, flashSpeed);
-        } else {
-            document.title = originalTitle;
-        }
-    }
-
-    function setupTitleObserver() {
-        const targetNode = document.getElementById('otk-stat-new-messages');
-        const newRepliesNode = document.getElementById('otk-stat-new-replies');
-        if (!targetNode) {
-            consoleError("Could not find the target node for title observer: #otk-stat-new-messages");
-            return;
-        }
-
-        const observer = new MutationObserver(mutations => {
-            mutations.forEach(mutation => {
-                const newMessagesText = targetNode.textContent.trim();
-                if (newMessagesText) {
-                    document.title = `${newMessagesText} ${originalTitle}`;
-                } else {
-                    document.title = originalTitle;
-                }
-            });
-        });
-
-        observer.observe(targetNode, {
-            childList: true,
-            characterData: true,
-            subtree: true
-        });
-
-        consoleLog("Title observer is set up and watching for changes on #otk-stat-new-messages.");
     }
 
     function createTrackerButton(text, id = null) {
@@ -6663,7 +6587,6 @@ function handleIntersection(entries, observerInstance) {
 }
 
 // --- Theme Settings Persistence ---
-const THEME_SETTINGS_KEY = 'otkThemeSettings';
 let pendingThemeChanges = {};
 
 function showApplyDiscardButtons() {
@@ -9866,46 +9789,16 @@ function setupTitleObserver() {
     const totalMessagesNode = document.getElementById('otk-total-messages-stat');
 
     if (!totalMessagesNode) {
-        console.warn('[TitleObserver] Could not find the total messages stat node for title updates.');
+        consoleWarn('[TitleObserver] Could not find the total messages stat node for title updates.');
         return;
     }
 
-    const updateTitle = () => {
-        const newMessagesNode = totalMessagesNode.querySelector('#otk-stat-new-messages');
-        const newRepliesNode = totalMessagesNode.querySelector('#otk-stat-new-replies');
-
-        const newMessagesText = (newMessagesNode?.textContent || '').trim();
-        const newRepliesText = (newRepliesNode?.textContent || '').trim();
-
-        let titlePrefix = '';
-        const hasMessages = newMessagesText.length > 0;
-        const hasReplies = newRepliesText.length > 0;
-
-        if (hasMessages && hasReplies) {
-            const msgCount = newMessagesText.replace(/\D/g, '');
-            const replyCount = newRepliesText.replace(/\D/g, '');
-            titlePrefix = `(${msgCount} | ${replyCount}) `;
-        } else if (hasMessages) {
-            titlePrefix = `${newMessagesText} `;
-        } else if (hasReplies) {
-            const replyCount = newRepliesText.replace(/\D/g, '');
-            titlePrefix = `(0 | ${replyCount}) `;
-        }
-
-        if (document.title !== originalTitle && !document.title.startsWith('(')) {
-            originalTitle = document.title;
-        }
-
-        document.title = titlePrefix + originalTitle;
-    };
-
-    const observer = new MutationObserver(updateTitle);
-
+    const observer = new MutationObserver(() => {
+        if (typeof updateTabTitle === 'function') updateTabTitle();
+    });
     const observerConfig = { childList: true, subtree: true, characterData: true };
-
     observer.observe(totalMessagesNode, observerConfig);
-
-    updateTitle();
+    if (typeof updateTabTitle === 'function') updateTabTitle();
 }
 
 function setupScrollButtons() {
