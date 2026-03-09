@@ -331,6 +331,7 @@
             html += `<br><a href="#" style="color:#f44;" id="clearMemory">
                         Clear Memory
                      </a>`;
+            html += `<br><span style="color:#fff; font-size:12px;">Selected: ${selectedLinks.size}</span>`;
         }
         // Debug info: show saved snapshot timestamp and saved count if provided
         if (savedSnapshot && savedSnapshot.ids) {
@@ -366,6 +367,7 @@
         const copySelClear = document.getElementById('copySelectedClear');
         if (copySelClear) copySelClear.onclick = e => {
             e.preventDefault();
+            if (!confirm('Are you sure you want to clear memory and copy selected?')) return;
             const arr = Array.from(selectedLinks);
             clearClipboard(); // Safe clear
             const updatedClipboard = appendToClipboard(arr); // Safe append
@@ -406,6 +408,7 @@
         const clearMemBtn = document.getElementById('clearMemory');
         if (clearMemBtn) clearMemBtn.onclick = e => {
             e.preventDefault();
+            if (!confirm('Are you sure you want to clear memory?')) return;
             clearClipboard();
             showNotification('Internal clipboard cleared!', '#95e1d3');
         };
@@ -547,6 +550,33 @@
             }
         }
     });
+    // ------------------ Leave Confirmation ------------------
+    document.addEventListener('click', e => {
+        const anchor = e.target.closest('a');
+        if (anchor && selectedLinks.size > 0) {
+            const href = anchor.getAttribute('href');
+            if (!href || href === '#' || href.startsWith('javascript:')) return;
+
+            if (anchor.closest('#exactVideoCountDisplay')) return;
+
+            // If it's a post link (video/photo), the script hijacks the click to toggle selection
+            // and prevents navigation anyway, so we don't show the "leave page" confirmation.
+            if (isPostLink(href)) return;
+
+            if (!confirm('You have videos selected. Are you sure you want to leave this page?')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+            }
+        }
+    }, true);
+
+    window.addEventListener('beforeunload', e => {
+        if (selectedLinks.size > 0) {
+            e.preventDefault();
+            e.returnValue = ''; // Standard way to trigger confirmation
+        }
+    });
+
     // ------------------ SPA Detection ------------------
     let lastUrl = location.href;
     setInterval(() => {
