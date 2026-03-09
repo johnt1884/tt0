@@ -59,6 +59,19 @@
     // Initial load
     internalClipboard = readClipboard();
 
+    let lastExtractionData = null;
+    function refreshUI() {
+        if (lastExtractionData) {
+            displayCount(
+                lastExtractionData.username,
+                lastExtractionData.count,
+                lastExtractionData.testNewCount,
+                lastExtractionData.newUrls,
+                lastExtractionData.savedSnapshot
+            );
+        }
+    }
+
     if (!window._tmk_extractRetry) window._tmk_extractRetry = 0;
     let notificationContainer = null;
     // ------------------ Basic Helpers ------------------
@@ -283,6 +296,7 @@
         } catch { return ''; }
     }
     function displayCount(username, count, testNewCount = 0, newUrls = [], savedSnapshot = null) {
+        lastExtractionData = { username, count, testNewCount, newUrls, savedSnapshot };
         let box = document.getElementById('exactVideoCountDisplay');
         if (!box) {
             box = document.createElement('div');
@@ -402,7 +416,7 @@
             e.preventDefault();
             selectedLinks.clear();
             document.querySelectorAll('.tmk-custom-checkbox').forEach(cb => cb.checked = false);
-            extractVideoCount();
+            refreshUI();
             showNotification('Selection cleared!', '#95e1d3');
         };
         const clearMemBtn = document.getElementById('clearMemory');
@@ -485,7 +499,7 @@
             cb.addEventListener('change', () => {
                 if (cb.checked) selectedLinks.add(href);
                 else selectedLinks.delete(href);
-                extractVideoCount();
+                refreshUI();
             });
             leftWrapper.appendChild(cb);
             a.style.position = 'relative';
@@ -523,16 +537,17 @@
                         } else {
                             selectedLinks.delete(linkHref);
                         }
-                        checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+                        // Avoid multiple re-renders during row selection
                     }
                 });
-                extractVideoCount();
+                refreshUI();
             });
             rightWrapper.appendChild(rowCb);
             a.appendChild(rightWrapper);
             // Click on video toggles individual if no selection
             a.addEventListener('click', e => {
                 if (selectedLinks.size > 0) {
+                    if (a._tmk_leaving) return;
                     e.preventDefault();
                     cb.checked = !cb.checked;
                     cb.dispatchEvent(new Event('change'));
@@ -551,21 +566,32 @@
         }
     });
     // ------------------ Leave Confirmation ------------------
-    document.addEventListener('click', e => {
+    window.addEventListener('click', e => {
         const anchor = e.target.closest('a');
         if (anchor && selectedLinks.size > 0) {
             const href = anchor.getAttribute('href');
             if (!href || href === '#' || href.startsWith('javascript:')) return;
 
             if (anchor.closest('#exactVideoCountDisplay')) return;
-
-            // If it's a post link (video/photo), the script hijacks the click to toggle selection
-            // and prevents navigation anyway, so we don't show the "leave page" confirmation.
-            if (isPostLink(href)) return;
+            if (e.target.closest('.tmk-custom-checkbox, .tmk-row-select-checkbox')) return;
 
             if (!confirm('You have videos selected. Are you sure you want to leave this page?')) {
                 e.preventDefault();
                 e.stopImmediatePropagation();
+
+                // If staying on page and it was a video link, toggle it
+                if (isPostLink(href)) {
+                    const cb = anchor.querySelector('.tmk-custom-checkbox');
+                    if (cb) {
+                        cb.checked = !cb.checked;
+                        if (cb.checked) selectedLinks.add(href);
+                        else selectedLinks.delete(href);
+                        refreshUI();
+                    }
+                }
+            } else {
+                // User confirmed leave. Mark it so our other listeners don't block it.
+                anchor._tmk_leaving = true;
             }
         }
     }, true);
