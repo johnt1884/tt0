@@ -596,12 +596,6 @@
         }
     }, true);
 
-    window.addEventListener('beforeunload', e => {
-        if (selectedLinks.size > 0) {
-            e.preventDefault();
-            e.returnValue = ''; // Standard way to trigger confirmation
-        }
-    });
 
     // ------------------ SPA Detection ------------------
     let lastUrl = location.href;
