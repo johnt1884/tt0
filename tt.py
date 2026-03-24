@@ -4,6 +4,8 @@ import glob
 import shutil
 import requests
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, quote
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -22,6 +24,14 @@ except ImportError:
 
 # --- Setup folders ---
 os.makedirs('downloads', exist_ok=True)
+
+# Shared resources locks
+print_lock = threading.Lock()
+existing_files_lock = threading.Lock()
+
+def safe_print(*args, **kwargs):
+    with print_lock:
+        print(*args, **kwargs)
 
 # --- Helper: extract username + videoid ---
 def extract_tiktok_info(url):
@@ -44,31 +54,19 @@ def sanitize_filename(username, videoid):
     return f"{safe_username} - {videoid}.mp4"
 
 # --- Helper: make unique filename if needed (checks downloads + mapped dirs) ---
-def make_unique_filename(filename, existing_files_set, base_td=r"C:\Bridge\Downloads\td"):
+def make_unique_filename(filename, existing_files_set):
     name, ext = os.path.splitext(filename)
     candidate = filename
     i = 1
-    # Build a set of existing filenames across downloads and mapped base_td directory
-    while True:
-        collision = False
-        if candidate in existing_files_set:
-            collision = True
-        else:
-            # also check mapped base_td recursively
-            for root, dirs, files in os.walk(base_td):
-                if candidate in files:
-                    collision = True
-                    break
-        if not collision:
-            break
-        candidate = f"{name} ({i}){ext}"
-        i += 1
-    # register candidate to existing_files_set to avoid future collisions
-    existing_files_set.add(candidate)
+    with existing_files_lock:
+        while candidate in existing_files_set:
+            candidate = f"{name} ({i}){ext}"
+            i += 1
+        existing_files_set.add(candidate)
     return candidate
 
 # --- Download helper ---
-def download_file_from_href(href, cookies, referer, tiktok_url, output_dir='downloads', max_retries=2, allow_duplicate=False, existing_files_set=None, base_td=r"C:\Bridge\Downloads\td"):
+def download_file_from_href(href, cookies, referer, tiktok_url, output_dir='downloads', max_retries=2, allow_duplicate=False, existing_files_set=None):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
         'Referer': referer,
@@ -81,202 +79,64 @@ def download_file_from_href(href, cookies, referer, tiktok_url, output_dir='down
             pass
     username, videoid = extract_tiktok_info(tiktok_url)
     filename = sanitize_filename(username, videoid)
+
     # If duplicates allowed, find a unique filename across downloads + mapped dirs
     if allow_duplicate:
-        if existing_files_set is None:
-            existing_files_set = set(os.listdir(output_dir))
-        unique_name = make_unique_filename(filename, existing_files_set, base_td=base_td)
+        unique_name = make_unique_filename(filename, existing_files_set)
         filepath = os.path.join(output_dir, unique_name)
     else:
         filepath = os.path.join(output_dir, filename)
+
     if not allow_duplicate and os.path.exists(filepath):
-        print(f" File already exists, skipping download: {os.path.basename(filepath)}")
+        safe_print(f" File already exists, skipping download: {os.path.basename(filepath)}")
         return True
+
     for attempt in range(1, max_retries + 1):
         try:
-            print(f" Downloading {os.path.basename(filepath)} (attempt {attempt})...")
+            safe_print(f" Downloading {os.path.basename(filepath)} (attempt {attempt})...")
+            # Increase timeout and use larger chunk size for speed
             response = session.get(href, headers=headers, stream=True, timeout=60)
             response.raise_for_status()
             expected_size = int(response.headers.get("Content-Length", 0))
+
             with open(filepath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
+                for chunk in response.iter_content(chunk_size=1024*1024): # 1MB chunks
                     if chunk:
                         f.write(chunk)
+
             actual_size = os.path.getsize(filepath)
             if expected_size and actual_size + 1024 < expected_size:
-                print(f"⚠️ Incomplete file ({actual_size} < {expected_size}) — retrying...")
-                # remove incomplete file before retry
+                safe_print(f"⚠️ Incomplete file ({actual_size} < {expected_size}) — retrying...")
                 try:
                     os.remove(filepath)
                 except Exception:
                     pass
                 continue
+
             if expected_size:
-                print(f" ✅ Saved: {filepath} ({actual_size / 1024 / 1024:.1f} MB / expected {expected_size / 1024 / 1024:.1f} MB)")
+                safe_print(f" ✅ Saved: {filepath} ({actual_size / 1024 / 1024:.1f} MB / expected {expected_size / 1024 / 1024:.1f} MB)")
             else:
-                print(f" ✅ Saved: {filepath} ({actual_size / 1024 / 1024:.1f} MB, size unknown)")
+                safe_print(f" ✅ Saved: {filepath} ({actual_size / 1024 / 1024:.1f} MB, size unknown)")
             return True
         except Exception as e:
-            print(f" Download error on attempt {attempt}: {e}")
-            # remove any partial file
+            safe_print(f" Download error on attempt {attempt}: {e}")
             try:
                 if os.path.exists(filepath):
                     os.remove(filepath)
             except Exception:
                 pass
         time.sleep(1)
-    print(f" ❌ Failed to download complete file after {max_retries} attempts.")
+    safe_print(f" ❌ Failed to download complete file after {max_retries} attempts.")
     return False
 
-# --- Read URLs ---
-with open('urls.txt', 'r', encoding='utf-8') as f:
-    urls = [line.strip() for line in f if line.strip()]
-
-# --- FILTER: remove any URL containing 'photo' (case-insensitive) ---
-filtered_out_urls = [u for u in urls if 'photo' in u.lower()]
-urls = [u for u in urls if 'photo' not in u.lower()]
-if filtered_out_urls:
-    print(f"Ignoring {len(filtered_out_urls)} URL(s) containing 'photo'.")
-
-if not urls:
-    print("No URLs in urls.txt after filtering.")
-    exit()
-
-# --- Load user directory map ---
-user_map = {}
-if os.path.exists('user_dir_map.txt'):
-    with open('user_dir_map.txt', 'r', encoding='utf-8') as f:
-        for line in f:
-            if ':' in line:
-                u, d = line.strip().split(':', 1)
-                user_map[u.strip()] = d.strip()
-
-# --- Gather existing filenames ---
-existing_files = set(os.listdir('downloads'))
-base_td = r"C:\Bridge\Downloads\td"
-for username, subdir in user_map.items():
-    target_dir = os.path.join(base_td, subdir)
-    if os.path.exists(target_dir):
-        for f in os.listdir(target_dir):
-            existing_files.add(f)
-
-# --- New menu: 12 options (4 actions × 3 sites) ---
-sites = [
-    ("TikWM", "https://www.tikwm.com/originalDownloader.html"),
-    ("MusicalDown", "https://musicaldown.com/en"),
-    ("Cobalt", "https://cobalt.tools")
-]
-actions = [
-    ("Start in headless mode", {"kill_before": False, "headless": True}),
-    ("Start in visible mode", {"kill_before": False, "headless": False}),
-    ("Kill all Chrome/Chromedriver, then start headless", {"kill_before": True, "headless": True}),
-    ("Kill all Chrome/Chromedriver, then start visible", {"kill_before": True, "headless": False})
-]
-print("Select one option (1-12):")
-menu_options = []
-idx = 1
-for s_name, s_url in sites:
-    for action_name, params in actions:
-        label = f"{idx}) {action_name} using {s_name}"
-        menu_options.append({
-            "index": idx,
-            "site_name": s_name,
-            "site_url": s_url,
-            "kill_before": params["kill_before"],
-            "headless": params["headless"]
-        })
-        print(label)
-        idx += 1
-choice = input("Choose option number (default 1): ").strip()
-if not choice.isdigit() or int(choice) < 1 or int(choice) > len(menu_options):
-    choice_idx = 1
-else:
-    choice_idx = int(choice)
-selected = menu_options[choice_idx - 1]
-use_cobalt = (selected["site_name"].lower() == "cobalt")
-use_musicaldown = (selected["site_name"].lower() == "musicaldown")
-use_tikwm = (selected["site_name"].lower() == "tikwm")
-start_url = selected["site_url"]
-kill_before_start = selected["kill_before"]
-headless_mode = selected["headless"]
-print(f"Selected: {selected['site_name']} — {'headless' if headless_mode else 'visible'} — kill_before={kill_before_start}")
-
-# For Cobalt, ask about undetected (only if Cobalt selected)
-use_uc = False
-if use_cobalt:
-    if not UC_AVAILABLE:
-        print("Warning: undetected-chromedriver not available. Install it for better Cloudflare bypass: pip install undetected-chromedriver")
-        use_uc = False
-    else:
-        use_uc_input = input("Use undetected-chromedriver for better Cloudflare compatibility? (y/n, default y): ").strip().lower()
-        use_uc = (use_uc_input != 'n')
-
-# --- Windows-only kill handling ---
-def kill_chrome_processes_windows():
-    try:
-        subprocess.call(['taskkill', '/f', '/im', 'chrome.exe'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-    try:
-        subprocess.call(['taskkill', '/f', '/im', 'chromedriver.exe'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-
-if kill_before_start:
-    print("Killing all Chrome and Chromedriver processes (Windows taskkill)...")
-    kill_chrome_processes_windows()
-    time.sleep(1.0)
-
-# --- Setup Chrome options ---
-options = webdriver.ChromeOptions()
-options.add_argument('--no-sandbox')
-options.add_argument('--disable-dev-shm-usage')
-options.add_argument('--disable-gpu')
-options.add_argument('--remote-debugging-port=9222')
-options.add_experimental_option("prefs", {
-    "download.default_directory": os.path.abspath("downloads"),
-    "download.prompt_for_download": False,
-    "download.directory_upgrade": True,
-    "safebrowsing.enabled": True
-})
-if headless_mode:
-    # Use the new headless mode flag where supported
-    options.add_argument("--headless=new")
-if use_cobalt and not headless_mode:
-    options.add_argument('--disable-blink-features=AutomationControlled')
-
-driver = None
-try:
-    if use_cobalt and use_uc:
-        driver = uc.Chrome(options=options, version_main=None) # Auto-detect Chrome version
-        print("Using undetected-chromedriver!")
-    else:
-        service = Service('./chromedriver.exe')
-        driver = webdriver.Chrome(service=service, options=options)
-        print(f"ChromeDriver launched successfully ({'headless' if headless_mode else 'visible'} mode)!")
-        if use_cobalt and not use_uc:
-            # try to remove webdriver flag
-            try:
-                driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            except Exception:
-                pass
-except WebDriverException as e:
-    print(f"Failed to launch ChromeDriver: {e}")
-    exit()
-
-driver.implicitly_wait(10)
-wait = WebDriverWait(driver, 20)
-
 # --- Helper: click "Do not consent" on MusicalDown whenever visible ---
-def try_click_do_not_consent():
+def try_click_do_not_consent(driver):
     try:
-        # selector for the consent button used in your example
         btns = driver.find_elements(By.CSS_SELECTOR, "button.fc-cta-do-not-consent, button.fc-button.fc-cta-do-not-consent")
         for btn in btns:
             try:
-                # ensure visible and clickable
                 if btn.is_displayed():
-                    print("Found 'Do not consent' button — clicking it.")
+                    safe_print("Found 'Do not consent' button — clicking it.")
                     driver.execute_script("arguments[0].click();", btn)
                     time.sleep(1.0)
                     return True
@@ -286,264 +146,283 @@ def try_click_do_not_consent():
         pass
     return False
 
-# --- For Cobalt, handle initial Turnstile if needed ---
-if use_cobalt:
-    print(f"Navigating to {start_url}...")
-    driver.get(start_url)
-    time.sleep(3) # Initial load
-    # Check for Turnstile
+def create_driver(selected, use_uc):
+    options = webdriver.ChromeOptions()
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--remote-debugging-port=0') # Let it pick a random port
+    options.add_experimental_option("prefs", {
+        "download.default_directory": os.path.abspath("downloads"),
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True
+    })
+    if selected["headless"]:
+        options.add_argument("--headless=new")
+
+    if selected["site_name"].lower() == "cobalt" and not selected["headless"]:
+        options.add_argument('--disable-blink-features=AutomationControlled')
+
+    driver = None
+    if selected["site_name"].lower() == "cobalt" and use_uc:
+        driver = uc.Chrome(options=options, version_main=None)
+    else:
+        service = Service('./chromedriver.exe')
+        driver = webdriver.Chrome(service=service, options=options)
+        if selected["site_name"].lower() == "cobalt":
+            try:
+                driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            except Exception:
+                pass
+    driver.implicitly_wait(5)
+    return driver
+
+# Thread-local storage for driver
+thread_local = threading.local()
+
+def get_driver(selected, use_uc):
+    if not hasattr(thread_local, "driver"):
+        thread_local.driver = create_driver(selected, use_uc)
+    return thread_local.driver
+
+def process_url(url, selected, use_uc, existing_files_set, check_exists):
+    url_success = False
+    sd_info = None
     try:
-        turnstile_iframe = driver.find_element(By.CSS_SELECTOR, "iframe[src*='turnstile']")
-        print("Cloudflare Turnstile detected. If in visible mode, solve it manually.")
-        if not headless_mode:
-            input("Press Enter after solving the Turnstile...")
-        else:
-            print("In headless mode, Turnstile may block. Consider visible mode or undetected-chromedriver.")
-            time.sleep(10) # Wait longer in headless
-    except NoSuchElementException:
-        print("No Turnstile detected on initial load.")
-    # Wait for URL input to be present - use more general selector
-    try:
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='url'], input[placeholder*='URL'], input[placeholder*='link'], textarea")))
-        print("Cobalt page loaded successfully.")
-    except TimeoutException:
-        print("Failed to load Cobalt input field. Check browser.")
-        exit()
-
-# --- Ask whether to check for existing files before downloading ---
-check_input = input("Check for existing files before downloading? (y/n, default y): ").strip().lower()
-check_exists = (check_input != 'n')
-
-# --- Prepare list of URLs to process depending on check_exists ---
-urls_to_process = []
-skipped_urls = []
-if check_exists:
-    for url in urls:
-        username, videoid = extract_tiktok_info(url)
-        filename = sanitize_filename(username, videoid)
-        if filename in existing_files:
-            skipped_urls.append(url)
-        else:
-            urls_to_process.append(url)
-else:
-    urls_to_process = urls.copy()
-
-print("\n=== Pre-check ===")
-print(f"Total URLs loaded (after filter): {len(urls)}")
-print(f"Filtered out containing 'photo': {len(filtered_out_urls)}")
-print(f"Already downloaded / will be skipped: {len(skipped_urls)}")
-print(f"Remaining URLs for processing: {len(urls_to_process)}")
-print("================\n")
-
-if not urls_to_process:
-    print("All URLs already downloaded or nothing to process! Exiting.")
-    try:
-        driver.quit()
-    except Exception:
-        pass
-    exit()
-
-# --- Batch processing ---
-total_urls = len(urls_to_process)
-successful = 0
-failed_urls = []
-sd_saved = [] # record situations where SD was used (url, href)
-batch_size = 6
-num_batches = (total_urls + batch_size - 1) // batch_size
-initial_count = len(glob.glob('downloads/*.mp4'))
-
-for batch_start in range(0, total_urls, batch_size):
-    batch_end = min(batch_start + batch_size, total_urls)
-    batch = urls_to_process[batch_start:batch_end]
-    current_batch = (batch_start // batch_size) + 1
-    print(f"\n--- Processing batch {current_batch}/{num_batches} (URLs {batch_start+1}-{batch_end} of {total_urls}) ---")
-    batch_success, batch_skipped = 0, 0
-    for idx, url in enumerate(batch, 1):
+        driver = get_driver(selected, use_uc)
+        wait = WebDriverWait(driver, 20)
         username, videoid = extract_tiktok_info(url)
         filename = sanitize_filename(username, videoid)
         filepath = os.path.join('downloads', filename)
+
         if check_exists and os.path.exists(filepath):
-            print(f" [{idx}/{len(batch)}] File exists, skipping: {filename}")
-            batch_skipped += 1
-            continue
-        print(f" Processing URL {idx}/{len(batch)}: {url[:120]}...")
-        retries, max_retries, url_success = 0, 3, False
+            safe_print(f" File exists, skipping: {filename}")
+            return True, None, None
+
+        retries, max_retries = 0, 3
         while retries < max_retries and not url_success:
             retries += 1
             try:
-                # Before each attempt, navigate to the start page for a clean form unless using Cobalt SPA behavior
-                if use_cobalt:
-                    try:
-                        driver.get(start_url)
-                        time.sleep(1.5)
-                    except Exception as e:
-                        print(f" Failed to load Cobalt start page: {e}")
-                else:
-                    try:
-                        driver.get(start_url)
-                        time.sleep(1.5)
-                    except Exception as e:
-                        print(f" Failed to load start page: {e}")
-                # Try click consent if present (for MusicalDown, but safe to attempt on others)
-                try_click_do_not_consent()
+                driver.get(selected["site_url"])
+                try_click_do_not_consent(driver)
+
                 href = None
                 cookies = []
                 referer = driver.current_url
-                if use_cobalt:
-                    # Cobalt flow (no outer try-except needed; inners handle specifics, main catches rest)
+
+                if selected["site_name"].lower() == "cobalt":
                     url_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='url'], input[placeholder*='URL'], input[placeholder*='link'], textarea")))
                     url_input.clear()
                     url_input.send_keys(url)
-                    # Click the download button (Cobalt may use ID "download-button")
                     try:
                         submit_btn = wait.until(EC.element_to_be_clickable((By.ID, "download-button")))
                     except TimeoutException:
-                        # Fallback to any button
                         submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button, input[type=submit]")))
                     submit_btn.click()
-                    print(f" Submitted to Cobalt (attempt {retries}). Waiting for download...")
+
+                    # Cobalt processing wait
                     time.sleep(5)
-                    # After clicking, try to find download link
                     try:
                         download_anchor = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[href$='.mp4'], .download a, a.download")))
-                        href = download_anchor.get_attribute('href')
-                        if not href:
-                            href = download_anchor.get_attribute('data-url')
-                        if not href:
-                            raise ValueError('No href found on download element')
+                        href = download_anchor.get_attribute('href') or download_anchor.get_attribute('data-url')
                         cookies = driver.get_cookies()
                         referer = driver.current_url
-                        print(f" Extracted href: {href[:120]}...")
                     except TimeoutException:
-                        # Fallback: check auto-download into downloads dir
-                        time.sleep(10)
-                        mp4_files = glob.glob('downloads/*.mp4')
-                        if mp4_files:
-                            latest_file = max(mp4_files, key=os.path.getctime)
-                            actual_size = os.path.getsize(latest_file)
-                            if actual_size > 10000:
-                                expected_filename = sanitize_filename(username, videoid)
-                                expected_path = os.path.join('downloads', expected_filename)
-                                if latest_file != expected_path:
-                                    if os.path.exists(expected_path):
-                                        name, ext = os.path.splitext(expected_filename)
-                                        i = 1
-                                        while os.path.exists(expected_path):
-                                            expected_path = os.path.join('downloads', f"{name} ({i}){ext}")
-                                            i += 1
-                                    os.rename(latest_file, expected_path)
-                                print(f" ✅ Auto-download detected and renamed: {os.path.basename(expected_path)} ({actual_size / 1024 / 1024:.1f} MB)")
-                                url_success = True
-                                batch_success += 1
-                                successful += 1
-                                break
                         raise
-                elif use_musicaldown:
-                    # musicaldown flow
+
+                elif selected["site_name"].lower() == "musicaldown":
+                    url_input = wait.until(EC.presence_of_element_located((By.ID, "link_url")))
+                    url_input.clear()
+                    url_input.send_keys(url)
+                    submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "form#submit-form button[type=submit], form button[type=submit]")))
+                    submit_btn.click()
+
                     try:
-                        # attempt to click consent if present before interacting
-                        try_click_do_not_consent()
-                        # musicaldown input usually has id 'link_url'
-                        url_input = wait.until(EC.presence_of_element_located((By.ID, "link_url")))
-                        url_input.clear()
-                        url_input.send_keys(url)
-                        # Submit the form (common selector)
-                        submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "form#submit-form button[type=submit], form button[type=submit]")))
-                        submit_btn.click()
-                        print(f" Submitted to MusicalDown (attempt {retries}). Waiting for download link...")
-                    except Exception as e:
-                        raise
-                    # After submitting, prefer HD anchor with data-event hd_download_click
-                    try:
-                        # First try HD download button explicitly
-                        try:
-                            download_anchor = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.download[data-event='hd_download_click']")), timeout=12)
-                        except TypeError:
-                            # Older selenium versions may not accept timeout param in this call
-                            download_anchor = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.download[data-event='hd_download_click']")))
-                        href = download_anchor.get_attribute('href')
-                        if not href:
-                            href = download_anchor.get_attribute('data-url')
-                        if not href:
-                            raise ValueError('No href found on HD download anchor')
+                        download_anchor = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.download[data-event='hd_download_click']")), timeout=12)
+                        href = download_anchor.get_attribute('href') or download_anchor.get_attribute('data-url')
                         cookies = driver.get_cookies()
                         referer = driver.current_url
-                        print(f" Extracted HD href: {href[:120]}...")
                     except TimeoutException:
-                        # HD not present — fallback to any 'a.download' (SD), record this event
                         try:
                             fallback_anchor = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.download")), timeout=12)
-                            href = fallback_anchor.get_attribute('href')
-                            if not href:
-                                href = fallback_anchor.get_attribute('data-url')
+                            href = fallback_anchor.get_attribute('href') or fallback_anchor.get_attribute('data-url')
                             cookies = driver.get_cookies()
                             referer = driver.current_url
-                            print(f" Extracted SD href (fallback): {href[:120]}...")
-                            # record SD fallback to sd_saved; we'll store url + href for final report
-                            sd_saved.append({"tiktok_url": url, "href": href})
+                            sd_info = {"tiktok_url": url, "href": href}
                         except TimeoutException:
                             raise
-                else:
-                    # tikwm flow (original)
+                else: # TikWM
+                    url_input = wait.until(EC.presence_of_element_located((By.ID, "params")))
+                    url_input.clear()
+                    url_input.send_keys(url)
+                    submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn-submit")))
+                    submit_btn.click()
+                    time.sleep(2)
                     try:
-                        url_input = wait.until(EC.presence_of_element_located((By.ID, "params")))
-                        url_input.clear()
-                        url_input.send_keys(url)
-                        submit_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn-submit")))
-                        submit_btn.click()
-                        print(f" Submitted to TikWM (attempt {retries}). Waiting...")
-                        time.sleep(2)
-                        try:
-                            error_box = driver.find_element(By.CSS_SELECTOR, "div.alert.alert-danger[role='alert']")
-                            if "url parsing is failed" in error_box.text.lower():
-                                print(" Parse failed — skipping this URL.")
-                                failed_urls.append(url)
-                                break
-                        except NoSuchElementException:
-                            pass
-                        download_link = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.btn.btn-success[download]")))
-                        href = download_link.get_attribute('href')
-                        if not href or 'mp4' not in href.lower():
-                            raise ValueError(f"Invalid href: {href}")
-                        cookies = driver.get_cookies()
-                        referer = driver.current_url
-                        print(f" Extracted href: {href[:120]}...")
-                    except TimeoutException:
-                        raise
+                        error_box = driver.find_element(By.CSS_SELECTOR, "div.alert.alert-danger[role='alert']")
+                        if "url parsing is failed" in error_box.text.lower():
+                            return False, url, None
+                    except NoSuchElementException:
+                        pass
+                    download_link = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.btn.btn-success[download]")))
+                    href = download_link.get_attribute('href')
+                    cookies = driver.get_cookies()
+                    referer = driver.current_url
 
-                # Attempt to download the extracted href (only if href was found)
-                if href and download_file_from_href(href, cookies, referer, url, allow_duplicate=not check_exists, existing_files_set=existing_files, base_td=base_td):
+                if href and download_file_from_href(href, cookies, referer, url, allow_duplicate=not check_exists, existing_files_set=existing_files_set):
                     url_success = True
-                    batch_success += 1
-                    successful += 1
-                    # After successful download, for non-Cobalt, navigate back to start page or remain for SPA
-                    if not use_cobalt:
-                        try:
-                            driver.get(start_url)
-                            time.sleep(0.5)
-                        except Exception:
-                            pass
                     break
-            except TimeoutException:
-                print(" Timeout waiting for result, retrying...")
-                time.sleep(5)
             except Exception as e:
-                print(f" Error on attempt {retries}: {e}")
-                if retries == max_retries:
-                    failed_urls.append(url)
+                safe_print(f" Error processing {url} on attempt {retries}: {e}")
                 time.sleep(1)
-        if not url_success:
-            print(f" URL {idx} failed after {max_retries} retries")
-            if url not in failed_urls:
-                failed_urls.append(url)
-        if idx < len(batch):
-            time.sleep(1)
-    current_total = len(glob.glob('downloads/*.mp4')) - initial_count
-    print(f"Batch {current_batch} complete ({batch_success}/{len(batch)} successful, {batch_skipped} skipped). Total processed: {current_total}/{total_urls}")
-    if batch_end < total_urls:
-        time.sleep(15)
 
-# --- Move Section ---
+        return url_success, (None if url_success else url), sd_info
+
+    except Exception as e:
+        safe_print(f" Fatal error for {url}: {e}")
+        return False, url, None
+
+def close_drivers(executor):
+    # This is a bit tricky with ThreadPoolExecutor and thread_local
+    # We'll use a small hack to run a task on each thread to close its driver
+    def _close():
+        if hasattr(thread_local, "driver"):
+            try:
+                thread_local.driver.quit()
+            except Exception:
+                pass
+            del thread_local.driver
+
+    # Run _close on all possible threads
+    futures = [executor.submit(_close) for _ in range(executor._max_workers * 2)]
+    for f in as_completed(futures): pass
+
+def main():
+    # --- Read URLs ---
+    if not os.path.exists('urls.txt'):
+        print("urls.txt not found.")
+        return
+    with open('urls.txt', 'r', encoding='utf-8') as f:
+        urls = [line.strip() for line in f if line.strip()]
+
+    # --- FILTER ---
+    filtered_out_urls = [u for u in urls if 'photo' in u.lower()]
+    urls = [u for u in urls if 'photo' not in u.lower()]
+    if filtered_out_urls:
+        print(f"Ignoring {len(filtered_out_urls)} URL(s) containing 'photo'.")
+
+    if not urls:
+        print("No URLs in urls.txt after filtering.")
+        return
+
+    # --- Load user directory map ---
+    user_map = {}
+    if os.path.exists('user_dir_map.txt'):
+        with open('user_dir_map.txt', 'r', encoding='utf-8') as f:
+            for line in f:
+                if ':' in line:
+                    u, d = line.strip().split(':', 1)
+                    user_map[u.strip()] = d.strip()
+
+    # --- Gather existing filenames ---
+    # PRE-SCAN ONLY ONCE
+    existing_files = set(os.listdir('downloads'))
+    base_td = r"C:\Bridge\Downloads\td"
+    print(f"Pre-scanning {base_td} for existing files...")
+    for username, subdir in user_map.items():
+        target_dir = os.path.join(base_td, subdir)
+        if os.path.exists(target_dir):
+            for f in os.listdir(target_dir):
+                existing_files.add(f)
+    print("Pre-scan complete.")
+
+    # --- Menu ---
+    sites = [
+        ("TikWM", "https://www.tikwm.com/originalDownloader.html"),
+        ("MusicalDown", "https://musicaldown.com/en"),
+        ("Cobalt", "https://cobalt.tools")
+    ]
+    actions = [
+        ("Start in headless mode", {"kill_before": False, "headless": True}),
+        ("Start in visible mode", {"kill_before": False, "headless": False}),
+        ("Kill all Chrome/Chromedriver, then start headless", {"kill_before": True, "headless": True}),
+        ("Kill all Chrome/Chromedriver, then start visible", {"kill_before": True, "headless": False})
+    ]
+    print("Select one option (1-12):")
+    menu_options = []
+    idx = 1
+    for s_name, s_url in sites:
+        for action_name, params in actions:
+            print(f"{idx}) {action_name} using {s_name}")
+            menu_options.append({
+                "index": idx,
+                "site_name": s_name,
+                "site_url": s_url,
+                "kill_before": params["kill_before"],
+                "headless": params["headless"]
+            })
+            idx += 1
+
+    choice = input("Choose option number (default 1): ").strip()
+    selected = menu_options[int(choice)-1] if choice.isdigit() and 1 <= int(choice) <= len(menu_options) else menu_options[0]
+
+    use_uc = False
+    if selected["site_name"].lower() == "cobalt":
+        if UC_AVAILABLE:
+            use_uc = input("Use undetected-chromedriver? (y/n, default y): ").strip().lower() != 'n'
+
+    concurrency = input("Number of concurrent downloads (default 3): ").strip()
+    concurrency = int(concurrency) if concurrency.isdigit() else 3
+
+    check_exists = input("Check for existing files before downloading? (y/n, default y): ").strip().lower() != 'n'
+
+    if selected["kill_before"]:
+        try:
+            subprocess.call(['taskkill', '/f', '/im', 'chrome.exe'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.call(['taskkill', '/f', '/im', 'chromedriver.exe'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+    # --- Processing ---
+    successful = 0
+    failed_urls = []
+    sd_saved = []
+
+    print(f"\nProcessing {len(urls)} URLs with concurrency {concurrency}...\n")
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {executor.submit(process_url, url, selected, use_uc, existing_files, check_exists): url for url in urls}
+        for future in as_completed(futures):
+            res_success, res_failed_url, res_sd_info = future.result()
+            if res_success:
+                successful += 1
+            if res_failed_url:
+                failed_urls.append(res_failed_url)
+            if res_sd_info:
+                sd_saved.append(res_sd_info)
+
+        print("\nCleaning up drivers...")
+        close_drivers(executor)
+
+    # --- Summary & Move ---
+    print(f"\nAutomation complete! Successful: {successful}/{len(urls)}")
+    if failed_urls:
+        print(f"Failed: {len(failed_urls)}")
+        if input("Generate failed_urls.txt? (y/n): ").strip().lower() == 'y':
+            with open('failed_urls.txt', 'w', encoding='utf-8') as f:
+                for u in failed_urls: f.write(u + '\n')
+
+    if sd_saved:
+        print(f"\nSD Fallback count: {len(sd_saved)}")
+        if input("Write SD fallback report? (y/n, default y): ").strip().lower() != 'n':
+            with open('sd_fallback.txt', 'w', encoding='utf-8') as f:
+                for s in sd_saved: f.write(f"{s['tiktok_url']} -> {s['href']}\n")
+
+    # Move logic
+    move_files_to_user_dirs(base_td)
+
 def load_user_map(map_file='user_dir_map.txt'):
     user_map = {}
     if os.path.exists(map_file):
@@ -561,6 +440,7 @@ def save_user_map(user_map, map_file='user_dir_map.txt'):
 
 def move_files_to_user_dirs(base_dir=r"C:\Bridge\Downloads\td"):
     user_map = load_user_map()
+    if not os.path.exists('downloads'): return
     downloads = [f for f in os.listdir('downloads') if f.lower().endswith('.mp4')]
     if not downloads:
         print("No files to move.")
@@ -622,46 +502,5 @@ def move_files_to_user_dirs(base_dir=r"C:\Bridge\Downloads\td"):
     print(f"\nMove summary: {moved} moved, {replaced} replaced, {skipped} skipped.")
     print("User directory mappings saved to user_dir_map.txt\n")
 
-# --- Summary ---
-print(f"\nAutomation complete! Successful: {successful}/{total_urls}")
-failed_count = len(failed_urls)
-print(f"Failed: {failed_count}/{total_urls}")
-if failed_count > 0:
-    resp = input(f"\nGenerate failed_urls.txt? (y/n): ").strip().lower()
-    if resp == 'y':
-        with open('failed_urls.txt', 'w', encoding='utf-8') as f:
-            for u in failed_urls:
-                f.write(u + '\n')
-        print("Generated failed_urls.txt")
-
-# SD fallback report (per your request)
-if sd_saved:
-    print("\n--- SD FALLBACK REPORT ---")
-    print(f"{len(sd_saved)} item(s) were downloaded via SD fallback (HD not available).")
-    for s in sd_saved:
-        print(f" TikTok URL: {s.get('tiktok_url')}")
-        print(f" SD href: {s.get('href')}")
-    # Optionally write to sd_fallback.txt
-    resp = input("Write SD fallback report to sd_fallback.txt? (y/n, default y): ").strip().lower()
-    if resp != 'n':
-        with open('sd_fallback.txt', 'w', encoding='utf-8') as f:
-            for s in sd_saved:
-                f.write(f"{s.get('tiktok_url')} -> {s.get('href')}\n")
-        print("sd_fallback.txt written.")
-
-# --- Always print failed URLs at the end ---
-if failed_urls:
-    print("\n=== FAILED URLS ===")
-    for u in failed_urls:
-        print(u)
-    print("====================\n")
-else:
-    print("\nNo failed URLs!")
-
-# --- Move downloaded files ---
-move_files_to_user_dirs()
-input("\nPress Enter to close...")
-try:
-    driver.quit()
-except Exception:
-    pass
+if __name__ == "__main__":
+    main()
